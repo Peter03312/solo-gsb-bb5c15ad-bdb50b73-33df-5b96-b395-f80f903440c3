@@ -4,7 +4,8 @@
 
 1. **登记危险区**：平面米制多边形（支持洞）+ UTC 左闭右开 `[start, end)` 生效时段；
 2. **批量提交轨迹点**：车次、点 ID、UTC 时刻、平面坐标；同点 ID 同内容重传幂等，异内容返回冲突；
-3. **穿越审计**：相邻点间按时间与坐标线性插值，仅在“轨迹覆盖且区域生效”的时间内计算穿越，按危险区返回起止区间与累计秒数。
+3. **穿越审计**：相邻点间按时间与坐标线性插值，仅在“轨迹覆盖且区域生效”的时间内计算穿越，按危险区返回起止区间与累计秒数；
+4. **修订复现**：每次登记/同 ID 覆盖原子分配一个**全局递增修订号**并保存各区**不可变历史版本**，穿越查询可按任意历史修订号复现当时的区域配置。
 
 ## 语义约定
 
@@ -18,6 +19,24 @@
 - 同车次同一 UTC 时刻只能属于一个点 ID，否则视为冲突（HTTP 409）。
 - 批量提交为**单事务原子写入**：任何一点校验/冲突失败，整批不写入任何数据。
 - SQLite 持久化到挂载卷，**进程/容器重启后记录仍可查询**。
+
+## 修订号与历史复现
+
+- 每次 `POST /api/v1/zones`（含同 ID 覆盖更新）都在**同一个数据库事务**内：
+  1. 分配一个**全局单调递增、不复用**的修订号（`revisions` 自增序列）；
+  2. 写入该区当时完整配置（几何 + 生效时段）的**不可变快照**（`zone_versions` / `zone_version_windows`）；
+  3. 更新"当前最新配置"表。三步一起提交，并发查询不会读到半次提交。
+- 登记/覆盖响应返回 `revision` 字段；`GET /api/v1/zones`、`GET /api/v1/zones/{zone_id}` 也带各区当前修订号；
+  `GET /api/v1/revisions` 返回当前最大修订号及全部修订事件。
+- 穿越查询加 `revision=N` 时：取**各区截至 N 的最后一个版本**参与核算——
+  - N 之后才登记的区**不参与**；指定 `zone_id` 时若该区在 N 时还未登记，返回 **404**；
+  - 沿用现有带洞边界规则、UTC 左闭右开窗口、相邻轨迹点插值规则，以及 `zone_id` / `since` / `until` 等既有参数；
+  - 响应返回 `revision`（即所用修订号）、穿越区间与累计时长。
+- **不传 `revision`** 时：路径、请求字段、核算逻辑与响应语义维持现状（查当前最新配置），响应仅额外附带 `revision`（当前最大修订号；库中无区域时为 `null`）。
+- 修订号不存在或超出当前范围（含库中尚无任何修订时指定 N）返回 **404 `not_found`**，错误信息给出当前有效范围；`revision` 必须为 ≥1 的整数（否则 422）。
+- **旧库迁移**：旧版本数据库首次启动时自动把现存区域整体迁移为**修订号 1 的基线版本**（一次事务完成，可重复安全执行），只迁移当时的当前配置，**不推断迁移前历史**；迁移后首次登记从修订号 2 开始。空旧库不占用修订号，首次登记仍为 1。
+- 并发安全：进程内以锁串行化数据库访问，写事务 `BEGIN IMMEDIATE`、读事务取 WAL 一致性快照，保证并发登记拿到唯一且连续的修订号，查询结果不会新旧混搭。
+
 
 ## 一键启动（Docker Compose）
 
@@ -68,14 +87,16 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/api/v1/zones` | 登记（或同 ID 覆盖更新）危险区 |
-| GET | `/api/v1/zones` | 列出全部危险区 |
-| GET | `/api/v1/zones/{zone_id}` | 查询单个危险区 |
+| POST | `/api/v1/zones` | 登记（或同 ID 覆盖更新）危险区，响应返回全局修订号 |
+| GET | `/api/v1/zones` | 列出全部危险区（各区带当前修订号） |
+| GET | `/api/v1/zones/{zone_id}` | 查询单个危险区（带当前修订号） |
+| GET | `/api/v1/revisions` | 当前最大修订号与全部修订事件列表 |
 | POST | `/api/v1/trips/{trip_id}/points` | 批量提交/重传某车次轨迹点（原子、幂等） |
 | GET | `/api/v1/trips/{trip_id}` | 查询车次全部轨迹点（按时刻排序） |
-| GET | `/api/v1/trips/{trip_id}/crossings` | 穿越审计结果 |
+| GET | `/api/v1/trips/{trip_id}/crossings` | 穿越审计结果（可按修订号复现） |
 
-穿越查询参数（均可选）：`zone_id`（只看某危险区）、`since` / `until`（UTC ISO 8601，半开 `[since, until)` 时间过滤）。
+穿越查询参数（均可选）：`zone_id`（只看某危险区）、`since` / `until`（UTC ISO 8601，半开 `[since, until)` 时间过滤）、
+`revision`（按该全局修订号复现：取各区截至该号的最后版本；不传则查当前最新配置）。
 
 时间字符串使用 ISO 8601 且**必须带时区**，推荐以 `Z` 结尾表示 UTC，例如 `2026-09-30T12:00:00Z`。
 
@@ -96,10 +117,10 @@ curl -s -X POST http://localhost:8080/api/v1/zones \
       {"start": "2026-09-30T00:00:00Z", "end": "2026-10-01T00:00:00Z"}
     ]
   }'
-# {"zone_id":"Z-A","status":"created","num_holes":1,"num_windows":1}
+# {"zone_id":"Z-A","status":"created","revision":1,"num_holes":1,"num_windows":1}
 ```
 
-环的首尾点无需重复给出；可登记多个生效时段（重叠/相接时段会合并处理）。
+响应中 `revision` 即本次登记分配的**全局递增修订号**；同 ID 再次覆盖时 `status` 为 `"updated"` 且返回新的、更大的修订号。环的首尾点无需重复给出；可登记多个生效时段（重叠/相接时段会合并处理）。
 
 ### 2) 批量提交轨迹点（允许乱序）
 
@@ -134,6 +155,7 @@ curl -s "http://localhost:8080/api/v1/trips/truck-7/crossings"
 ```json
 {
   "trip_id": "truck-7",
+  "revision": 1,
   "point_count": 3,
   "zones": [
     {
@@ -159,12 +181,53 @@ curl -s "http://localhost:8080/api/v1/trips/truck-7/crossings"
 curl -s "http://localhost:8080/api/v1/trips/truck-7/crossings?zone_id=Z-A&since=2026-09-30T12:00:30Z&until=2026-09-30T12:01:30Z"
 ```
 
+### 4) 现场修订后按修订号复现历史核算
+
+现场会修订危险区几何或生效时段，已出具的核算需要按当时的区域配置复现。每次登记/
+覆盖都会分配一个新修订号，穿越查询加 `revision=N` 即取**各区截至 N 的最后版本**：
+
+```bash
+# 初次登记 -> revision=1
+curl -s -X POST http://localhost:8080/api/v1/zones -H 'Content-Type: application/json' -d '{
+  "zone_id": "Z-A",
+  "exterior": [[0,0],[100,0],[100,100],[0,100]],
+  "windows": [{"start": "2026-09-30T00:00:00Z", "end": "2026-10-01T00:00:00Z"}]
+}'
+# {"zone_id":"Z-A","status":"created","revision":1,...}
+
+# 现场调整（缩小生效窗口）-> revision=2
+curl -s -X POST http://localhost:8080/api/v1/zones -H 'Content-Type: application/json' -d '{
+  "zone_id": "Z-A",
+  "exterior": [[0,0],[100,0],[100,100],[0,100]],
+  "windows": [{"start": "2026-09-30T12:00:30Z", "end": "2026-09-30T12:01:30Z"}]
+}'
+# {"zone_id":"Z-A","status":"updated","revision":2,...}
+
+# 最新配置（不传 revision）：按 12:00:30~12:01:30 的窗口核算
+curl -s "http://localhost:8080/api/v1/trips/truck-7/crossings?zone_id=Z-A"
+
+# 复现 revision=1 时的全天窗口核算（响应回显所用修订号）
+curl -s "http://localhost:8080/api/v1/trips/truck-7/crossings?zone_id=Z-A&revision=1"
+# {"trip_id":"truck-7","revision":1,...}
+```
+
+- 不传 `revision`：维持原有"当前最新配置"路径与字段，仅在响应中附加 `revision`（当前最大修订号）。
+- 指定修订号时，可与 `since`/`until` 组合；N 之后才登记的区不参与，指定 `zone_id` 则返回 404。
+- 查看可用修订号范围与每次修订对应的区：`GET /api/v1/revisions`。
+- 修订号不存在或超出当前范围：
+
+```bash
+curl -i "http://localhost:8080/api/v1/trips/truck-7/crossings?revision=99"
+# HTTP/1.1 404 Not Found
+# {"error":"not_found","detail":"修订号不存在或超出当前范围: 99（当前有效范围 1..2）"}
+```
+
 ## 错误响应
 
 - `400 validation_error`：几何/时间/坐标语义非法（自交多边形、洞越界、非有限坐标、时区缺失等）。
+- `404 not_found`：危险区或车次不存在；指定的 `revision` 不存在或超出当前范围；指定版本中区域尚未登记。
 - `409 conflict`：同点 ID 异内容，或同车次同刻关联了不同点 ID。
-- `404 not_found`：危险区或车次不存在。
-- `422`：请求体不符合 JSON 模式（类型错误、多余字段、缺字段）。
+- `422`：请求参数/体不符合模式（如 `revision=0`、非整数、类型错误、多余字段、缺字段）。
 
 ## 运行测试
 
@@ -174,7 +237,9 @@ python -m pytest -q
 ```
 
 测试覆盖：带洞多边形裁剪、外边界计入、洞与洞边界剔除、零时长接触、自交/洞越界拒绝、
-幂等与冲突、批量原子性、乱序重建、生效时段半开裁剪、区间合并、重启持久化等。
+幂等与冲突、批量原子性、乱序重建、生效时段半开裁剪、区间合并、重启持久化，以及修订号
+单调分配、按修订号复现几何/窗口、未登记区不参与、超范围 404、并发登记与查询一致性、
+旧库基线迁移（修订号 1、迁移幂等、空库不占号）等。
 
 ## 目录结构
 

@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from .config import get_settings
 from .db import Database
 from .schemas import PointBatch, ZoneCreate
-from .service import AuditService, ConflictError, ValidationError
+from .service import AuditService, ConflictError, NotFoundError, ValidationError
 
 settings = get_settings()
 db = Database(settings)
@@ -26,11 +26,13 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="工地作业车危险区穿越审计服务",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
     description=(
         "登记带洞米制多边形危险区及其 UTC 半开生效时段；批量提交车辆轨迹点，"
-        "查询各危险区的穿越区间与累计时长。"
+        "查询各危险区的穿越区间与累计时长。\n\n"
+        "每次区域登记/覆盖返回全局递增修订号并保留各区不可变历史版本；"
+        "穿越查询可用 revision 参数复现该修订号时的区域配置。"
     ),
 )
 
@@ -43,6 +45,11 @@ async def _validation_handler(_: Request, exc: ValidationError) -> JSONResponse:
 @app.exception_handler(ConflictError)
 async def _conflict_handler(_: Request, exc: ConflictError) -> JSONResponse:
     return JSONResponse(status_code=409, content={"error": "conflict", "detail": str(exc)})
+
+
+@app.exception_handler(NotFoundError)
+async def _not_found_handler(_: Request, exc: NotFoundError) -> JSONResponse:
+    return JSONResponse(status_code=404, content={"error": "not_found", "detail": str(exc)})
 
 
 @app.get("/health")
@@ -60,6 +67,7 @@ def index() -> dict:
             "POST /api/v1/zones",
             "GET  /api/v1/zones",
             "GET  /api/v1/zones/{zone_id}",
+            "GET  /api/v1/revisions",
             "POST /api/v1/trips/{trip_id}/points",
             "GET  /api/v1/trips/{trip_id}",
             "GET  /api/v1/trips/{trip_id}/crossings",
@@ -85,6 +93,12 @@ def get_zone(zone_id: str) -> JSONResponse:
             status_code=404, content={"error": "not_found", "detail": f"危险区不存在: {zone_id}"}
         )
     return JSONResponse(content=detail)
+
+
+@app.get("/api/v1/revisions")
+def get_revisions() -> dict:
+    """返回当前最大修订号与全部修订事件（用于确认可复现的修订号范围）。"""
+    return service.list_revisions()
 
 
 @app.post("/api/v1/trips/{trip_id}/points")
@@ -127,8 +141,18 @@ def get_crossings(
     zone_id: Optional[str] = Query(default=None),
     since: Optional[str] = Query(default=None, description="只统计该 UTC 时刻（含）之后"),
     until: Optional[str] = Query(default=None, description="只统计该 UTC 时刻（不含）之前"),
+    revision: Optional[int] = Query(
+        default=None,
+        ge=1,
+        description=(
+            "按指定全局修订号复现：取各区截至该号的最后版本。"
+            "不传则使用当前最新配置。不存在或超出当前范围返回 404。"
+        ),
+    ),
 ) -> dict:
-    return service.query_crossings(trip_id, zone_id=zone_id, since=since, until=until)
+    return service.query_crossings(
+        trip_id, zone_id=zone_id, since=since, until=until, revision=revision
+    )
 
 
 if __name__ == "__main__":
