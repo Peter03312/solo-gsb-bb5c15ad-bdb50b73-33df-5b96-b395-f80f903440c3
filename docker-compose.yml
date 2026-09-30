@@ -1,0 +1,24 @@
+services:
+  audit:
+    build: .
+    image: danger-zone-audit:1.0.0
+    container_name: danger-zone-audit
+    ports:
+      - "8080:8080"
+    environment:
+      # SQLite 数据文件（挂载到命名卷，重启后记录仍可查询）
+      DZ_DB_PATH: /data/dangerzones.db
+      DZ_HOST: 0.0.0.0
+      DZ_PORT: "8080"
+    volumes:
+      - audit-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health').status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  audit-data:
